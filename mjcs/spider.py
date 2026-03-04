@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ElementTree
 import json
 import logging
 import string
+import time
 import requests
 import re
 import boto3
@@ -216,11 +217,15 @@ class SearchNode:
         except CompletedSearchNoResults:
             return 0
         
-        # Parse XML
+        # Parse XML (escape bare & chars in firm names before parsing)
+        xml_text = re.sub(r'&(?!amp;|lt;|gt;|apos;|quot;|#)', '&amp;', response.text)
         try:
-            root = ElementTree.fromstring(response.text)
+            root = ElementTree.fromstring(xml_text)
         except ElementTree.ParseError as e:
-            logger.warning(f'Failed to parse XML: {e}')
+            err_line, err_col = e.position
+            xml_lines = xml_text.split('\n')
+            problem = xml_lines[err_line-1] if err_line <= len(xml_lines) else '?'
+            logger.warning(f'Failed to parse XML: {e} | line content: {repr(problem[:120])}')
             return 0
 
         rows = [[element.text for element in row] for row in root]
@@ -322,7 +327,7 @@ class SearchNode:
             response = session.request(
                 method='POST',
                 url=f'{config.MJCS_BASE_URL}/inquirySearch.jis',
-                data=query_params
+                data={k: v for k, v in query_params.items() if v is not None}
             )
         except requests.Timeout:
             raise RequestTimeout
@@ -350,6 +355,7 @@ class SearchNode:
                 re.search(r'<span class="error">\s*<br>Invalid Search Criteria!',response.text)):
             raise CompletedSearchNoResults
 
+        time.sleep(2)  # Rate-limit protection: 2s between queries
         return response
 
     def __spawn_children(self):

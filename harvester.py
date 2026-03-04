@@ -15,8 +15,8 @@ import argparse
 import logging
 import subprocess
 import socket
-import watchtower
-from ec2_metadata import ec2_metadata
+# import watchtower  # disabled
+# from ec2_metadata import ec2_metadata  # disabled
 from sqlalchemy import create_engine
 from sqlalchemy.sql import text
 from multiprocessing import set_start_method
@@ -377,13 +377,7 @@ if __name__ == '__main__':
         args.environment_short = 'prod'
     config.initialize_from_environment(args.environment, args.profile)
 
-    if args.cloudwatch:
-        logger.addHandler(watchtower.CloudWatchLogHandler(
-            log_group_name=args.cloudwatch,
-            log_stream_name=ec2_metadata.instance_id,
-            log_group_retention_days=config.CLOUDWATCH_RETENTION_DAYS,
-            boto3_client=config.boto3_session.client('logs')
-        ))
+    # CloudWatch logging disabled (no AWS)
 
     if hasattr(args, 'func'):
         args.func(args)

@@ -1,0 +1,12 @@
+name: Notify on Push
+
+on:
+  push:
+    branches: [main, master]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code updated
+        run: echo "CaseHarvester code pushed. Spider must run from residential IP (Mac)."

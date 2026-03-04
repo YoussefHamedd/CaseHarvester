@@ -203,6 +203,7 @@ class Scraper:
                         except FailedScrape:
                             pass
                         item.delete()
+                        time.sleep(3)  # Rate-limit protection
                 else:
                     logger.info('No items in scraper queue.')
                     break
@@ -222,19 +223,22 @@ class Scraper:
         try:
             response = self.session.request(
                 method='GET',
-                url = f'{config.MJCS_BASE_URL}/inquirySearchParam.jis'
+                url = f'{config.MJCS_BASE_URL}/inquirySearch.jis'
             )
         except requests.Timeout:
             raise RequestTimeout
-        
+
         if response.status_code == 403:
             raise Forbidden
         elif response.status_code != 200:
             logger.debug(f"Failed to retrieve search page: {response.status_code}")
             raise FailedScrapeUnknownError(response.text)
-        
+
         soup = BeautifulSoup(response.text, 'html.parser')
-        searchtype = soup.find('input',{'name':'searchtype'}).get('value')
+        searchtype_input = soup.find('input',{'name':'searchtype'})
+        if not searchtype_input:
+            raise FailedScrapeUnknownError("No searchtype input on search page")
+        searchtype = searchtype_input.get('value')
 
         # Now request the actual case details
         try:
