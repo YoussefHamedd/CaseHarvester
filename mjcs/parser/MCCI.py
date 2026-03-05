@@ -19,22 +19,25 @@ class MCCIParser(CaseDetailsParser):
 
     def __init__(self, case_number, html):
         self.case_number = case_number
-        strainer = SoupStrainer('div',class_='BodyWindow')
-        self.soup = BeautifulSoup(html,'html.parser',parse_only=strainer)
-        if len(self.soup.contents) != 1 or not self.soup.div:
-            raise ParserError("Unexpected HTML format", self.soup)
+        full_soup = BeautifulSoup(html,'html.parser')
+        body_window = full_soup.find('div', class_='BodyWindow')
+        if not body_window:
+            raise ParserError("Unexpected HTML format - BodyWindow not found")
+        self.soup = body_window
         self.marked_for_deletion = []
 
     def header(self, soup):
         header = soup.find('div',class_='Header')
-        header.decompose()
+        if header:
+            header.decompose()
         subheaders = soup.find_all('div',class_='Subheader')
         for subheader in subheaders:
             subheader.decompose()
 
     def footer(self, soup):
         footer = soup.find('div',class_='InfoStatement',string=re.compile('This is an electronic case record'))
-        footer.decompose()
+        if footer:
+            footer.decompose()
 
     #########################################################
     # CASE INFORMATION

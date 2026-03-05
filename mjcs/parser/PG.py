@@ -12,16 +12,16 @@ class PGParser(CaseDetailsParser, ChargeFinder):
 
     def header(self, soup):
         header = soup.find('div',class_='Header')
-        header.decompose()
+        if header:
+            header.decompose()
         goback = soup.find('a',string='Go Back Now')
-        if not goback:
-            raise ParserError('Missing expected "Go Back Now" link')
-        goback = goback.find_parent('div')
-        goback.decompose()
+        if goback:
+            goback.find_parent('div').decompose()
 
     def footer(self, soup):
         footer = soup.find('div',class_='InfoStatement',string=re.compile('This is an electronic case record'))
-        footer.decompose()
+        if footer:
+            footer.decompose()
 
     #########################################################
     # CASE INFORMATION

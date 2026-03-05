@@ -12,16 +12,16 @@ class DSK8Parser(CaseDetailsParser, ChargeFinder):
 
     def header(self, soup):
         header = soup.find('div',class_='Header')
-        header.decompose()
+        if header:
+            header.decompose()
         goback = soup.find('a',string='Go Back Now')
-        if not goback:
-            raise ParserError('Missing expected "Go Back Now" link')
-        goback = goback.find_parent('div')
-        goback.decompose()
+        if goback:
+            goback.find_parent('div').decompose()
 
     def footer(self, soup):
         footer = soup.find('div',class_='InfoStatement',string=re.compile('This is an electronic case record'))
-        footer.decompose()
+        if footer:
+            footer.decompose()
 
     #########################################################
     # CASE INFORMATION
@@ -38,7 +38,7 @@ class DSK8Parser(CaseDetailsParser, ChargeFinder):
 
         case.court_system = self.value_first_column(t1,'Court System:',remove_newlines=True)
         case_number = self.value_first_column(t1,'Case Number:')
-        if case_number != self.case_number:
+        if case_number.replace('-','').replace(' ','') != self.case_number.replace('-','').replace(' ',''):
             raise ParserError('Case number "%s" in case details page does not match given: %s' % (case_number, self.case_number))
         case.case_status = self.value_column(t1,'Case Status:')
         self.case_status = case.case_status

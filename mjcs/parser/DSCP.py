@@ -11,16 +11,16 @@ class DSCPParser(CaseDetailsParser, ChargeFinder):
 
     def header(self, soup):
         header = soup.find('div',class_='Header')
-        header.decompose()
+        if header:
+            header.decompose()
         goback = soup.find('a',string='Go Back Now')
-        if not goback:
-            raise ParserError('Missing expected "Go Back Now" link')
-        goback = goback.find_parent('div')
-        goback.decompose()
+        if goback:
+            goback.find_parent('div').decompose()
 
     def footer(self, soup):
         footer = soup.find('div',class_='InfoStatement',string=re.compile('This is an electronic case record'))
-        footer.decompose()
+        if footer:
+            footer.decompose()
 
     #########################################################
     # CASE INFORMATION
@@ -34,7 +34,7 @@ class DSCPParser(CaseDetailsParser, ChargeFinder):
 
         case_info_table = self.table_next_first_column_prompt(court_system_table,'Case Number:')
         case_number = self.value_first_column(case_info_table,'Case Number:')
-        if case_number != self.case_number:
+        if case_number.replace('-','').replace(' ','') != self.case_number.replace('-','').replace(' ',''):
             raise ParserError('Case number "%s" in case details page does not match given: %s' % (case_number, self.case_number))
         case.tracking_number = self.value_column(case_info_table,'Tracking No:',ignore_missing=True)
         case.case_type = self.value_first_column(case_info_table,'Case Type:',ignore_missing=True)

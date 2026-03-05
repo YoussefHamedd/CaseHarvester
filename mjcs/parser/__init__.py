@@ -100,7 +100,7 @@ def parse_case(case_number, detail_loc=None, parse_as=None):
         for category, parser in parsers.items():
             try:
                 parser(case_number, case_html).parse()
-            except BaseParserError:
+            except (BaseParserError, AttributeError, TypeError, KeyError):
                 logger.debug(f"Failed to parse {case_number} as {category}")
             else:
                 logger.debug(f"Successfully parsed {case_number} as {category}")

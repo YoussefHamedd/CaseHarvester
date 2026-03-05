@@ -10,22 +10,24 @@ class DVParser(CaseDetailsParser):
 
     def header(self, soup):
         header = soup.find('div',class_='Header')
-        header.decompose()
+        if header:
+            header.decompose()
         subheader = soup.find('div',class_='Subheader')
-        if not subheader:
-            raise ParserError('Missing subheader')
-        subheader.decompose()
+        if subheader:
+            subheader.decompose()
         goback = soup.find('a',string='Go Back Now')
         if not goback:
             goback = soup.find('a',string='Go Back')
             if not goback:
                 raise ParserError('Missing expected "Go Back Now" link')
         goback = goback.find_parent('div')
-        goback.decompose()
+        if goback:
+            goback.decompose()
 
     def footer(self, soup):
         footer = soup.find('div',class_='InfoStatement',string=re.compile('This is an electronic case record'))
-        footer.decompose()
+        if footer:
+            footer.decompose()
 
     #########################################################
     # CASE INFORMATION

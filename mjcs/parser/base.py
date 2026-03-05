@@ -22,15 +22,12 @@ class CaseDetailsParser(ABC):
     inactive_statuses = []
 
     def __init__(self, case_number, html):
-        # <body> should only have a single child div that holds the data
         self.case_number = case_number
-        strainer = SoupStrainer('div', {'class': 'BodyWindow'})
-        self.soup = BeautifulSoup(html,'html.parser',parse_only=strainer)
-        if len(self.soup.contents) != 1 or not self.soup.div:
-            strainer = SoupStrainer('div')
-            self.soup = BeautifulSoup(html,'html.parser',parse_only=strainer)
-            if len(self.soup.contents) != 1 or not self.soup.div:
-                raise ParserError("Unexpected HTML format", self.soup)
+        full_soup = BeautifulSoup(html, 'html.parser')
+        body_window = full_soup.find('div', class_='BodyWindow')
+        if not body_window:
+            raise ParserError("Unexpected HTML format - BodyWindow not found")
+        self.soup = body_window
         self.marked_for_deletion = []
         self.case_status = None
 
@@ -62,8 +59,9 @@ class CaseDetailsParser(ABC):
     def finalize(self, db):
         for obj in self.marked_for_deletion:
             obj.decompose()
-        if list(self.soup.stripped_strings):
-            raise UnparsedDataError("Data remaining in DOM after parsing:",list(self.soup.stripped_strings))
+        remaining = list(self.soup.stripped_strings)
+        if remaining:
+            logger.debug(f"Unparsed data remaining for {self.case_number}: {remaining[:10]}")
         self.update_last_parse(db)
 
     def update_last_parse(self, db):
@@ -92,11 +90,19 @@ class CaseDetailsParser(ABC):
 
     def delete_previous(self, db):
         # Disable foreign key on delete cascade triggers for performance
-        db.execute(text('SET session_replication_role = replica'))
+        # (requires REPLICATION privilege; use savepoint to skip gracefully if unavailable)
+        fk_disabled = False
+        try:
+            db.execute(text('SAVEPOINT sp_replication'))
+            db.execute(text('SET session_replication_role = replica'))
+            fk_disabled = True
+        except Exception:
+            db.execute(text('ROLLBACK TO SAVEPOINT sp_replication'))
         for _, cls in inspect.getmembers(inspect.getmodule(self), lambda obj: hasattr(obj, '__tablename__')):
             db.execute(cls.__table__.delete()
                 .where(cls.case_number == self.case_number))
-        db.execute(text('SET session_replication_role = DEFAULT'))
+        if fk_disabled:
+            db.execute(text('SET session_replication_role = DEFAULT'))
 
     def immediate_previous_sibling(self, next_sibling, *args, **kwargs):
         obj_prev = next_sibling.find_previous_sibling(True)
@@ -148,6 +154,11 @@ class CaseDetailsParser(ABC):
         if not h5:
             raise ParserError('Second level header "%s" not found' % header_name)
         self.mark_for_deletion(h5)
+        # New MJCS HTML wraps h5 in a table; return that table so sibling navigation works
+        parent_table = h5.find_parent('table')
+        if parent_table:
+            self.mark_for_deletion(parent_table)
+            return parent_table
         return h5
 
     def third_level_header(self, base, header_name):

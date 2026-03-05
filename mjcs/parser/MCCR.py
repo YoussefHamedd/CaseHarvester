@@ -17,14 +17,16 @@ class MCCRParser(CaseDetailsParser, ChargeFinder):
 
     def header(self, soup):
         header = soup.find('div',class_='Header')
-        header.decompose()
+        if header:
+            header.decompose()
         subheaders = soup.find_all('div',class_='Subheader')
         for subheader in subheaders:
             subheader.decompose()
 
     def footer(self, soup):
         footer = soup.find('div',class_='InfoStatement',string=re.compile('This is an electronic case record'))
-        footer.decompose()
+        if footer:
+            footer.decompose()
 
     #########################################################
     # CASE INFORMATION
@@ -38,7 +40,7 @@ class MCCRParser(CaseDetailsParser, ChargeFinder):
         case = MCCR(case_number=self.case_number)
         case.court_system = self.value_first_column(t1,'Court System:',remove_newlines=True)
         case_number = self.value_first_column(t1,'Case Number:')
-        if case_number != self.case_number:
+        if case_number.replace('-','').replace(' ','') != self.case_number.replace('-','').replace(' ',''):
             raise ParserError(f'Case number "{case_number}" in case details page does not match given: {self.case_number}')
         case.sub_type = self.value_column(t1,'Sub Type:')
         tracking_number_span = t2.find('span',class_='Prompt',string='Tracking Number:')
