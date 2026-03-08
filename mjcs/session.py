@@ -27,17 +27,20 @@ class Forbidden(Exception):
     pass
 
 
-def _build_session():
+def _build_session(scraperapi_session_id=None):
     import requests as std_requests
     import urllib3
+    import random
     proxy = os.getenv("SCRAPER_PROXY")
     scraperapi_key = os.getenv("SCRAPERAPI_KEY")
 
     if scraperapi_key:
         # ScraperAPI handles TLS fingerprinting and IP rotation on their end.
-        # Use standard requests (not curl_cffi) to avoid proxy SSL cert issues.
-        proxy_url = f"http://scraperapi:{scraperapi_key}@proxy-server.scraperapi.com:8001"
-        logger.info("Using ScraperAPI proxy for IP ban bypass")
+        # Use session persistence (session_number) so all requests in a session
+        # go through the SAME residential IP — required for cookie-based auth.
+        session_id = scraperapi_session_id or random.randint(1, 99999)
+        proxy_url = f"http://scraperapi.session_number={session_id}:{scraperapi_key}@proxy-server.scraperapi.com:8001"
+        logger.info(f"Using ScraperAPI proxy (session {session_id}) for IP ban bypass")
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         session = std_requests.Session()
         session.proxies = {"http": proxy_url, "https": proxy_url}
@@ -54,10 +57,14 @@ def _build_session():
 class MjcsSession:
     def __init__(self):
         self.requests = 0
+        self._scraperapi_session_id = None  # assigned on first new_session
         self.new_session()
 
     def new_session(self):
-        self.session = _build_session()
+        import random
+        # Use a new random session ID each time to get a fresh ScraperAPI IP
+        self._scraperapi_session_id = random.randint(1, 99999)
+        self.session = _build_session(scraperapi_session_id=self._scraperapi_session_id)
         # Proactively accept disclaimer so the session is ready to search
         try:
             self.renew()
