@@ -1,7 +1,7 @@
 from ..config import config
 from ..util import (NoItemsInQueue, db_session, get_detail_loc, send_to_queue)
 from ..models import Case
-from sqlalchemy import and_, update, select, text
+from sqlalchemy import and_, or_, update, select, text
 from sqlalchemy.exc import PendingRollbackError, IntegrityError
 import json
 import logging
@@ -137,8 +137,9 @@ class Parser:
             filter = and_(Case.last_parse == None, Case.last_scrape != None,
                 Case.detail_loc == detail_loc)
         else:
+            # Include both known parser types AND 'Unknown' (auto-detect will handle those)
             filter = and_(Case.last_parse == None, Case.last_scrape != None,
-                Case.detail_loc.in_(parsers.keys()))
+                or_(Case.detail_loc.in_(parsers.keys()), Case.detail_loc == 'Unknown'))
         with db_session() as db:
             self.load_into_queue(db.execute(select(Case.case_number, Case.detail_loc).distinct().where(filter)).all(), config.parser_queue)
     
@@ -160,7 +161,7 @@ class Parser:
                 Case.detail_loc == detail_loc)
         else:
             filter = and_(Case.last_scrape != None,
-                Case.detail_loc.in_(parsers.keys()))
+                or_(Case.detail_loc.in_(parsers.keys()), Case.detail_loc == 'Unknown'))
         with db_session() as db:
             self.load_into_queue(db.execute(select(Case.case_number, Case.detail_loc).distinct().where(filter)).all(), config.parser_queue)
 

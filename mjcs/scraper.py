@@ -70,6 +70,12 @@ class Scraper:
             self._session = MjcsSession()
         return self._session
 
+    def fresh_session(self):
+        """Force a completely new session (new HTTP client, new cookies)."""
+        if hasattr(self, '_session'):
+            del self._session
+        return self.session
+
     def record_metrics(self):
         now = datetime.now()
         new_scrape_count = self.scrapes
@@ -198,12 +204,18 @@ class Scraper:
                         body = json.loads(item.body)
                         case_number = body['case_number']
                         detail_loc = body.get('detail_loc')
+                        # Use a fresh session per case to avoid per-session rate limits
+                        self.fresh_session()
                         try:
                             self.scrape_case(case_number, detail_loc)
                         except FailedScrape:
                             pass
+                        except Exception as e:
+                            # Session-level errors (e.g. repeated disclaimers) - reset and continue
+                            logger.warning(f"Session error scraping {case_number}: {e}. Waiting before retry...")
+                            time.sleep(60)  # Longer cooldown after a session failure
                         item.delete()
-                        time.sleep(3)  # Rate-limit protection
+                        time.sleep(15)  # Rate-limit protection (15s between cases)
                 else:
                     logger.info('No items in scraper queue.')
                     break

@@ -67,15 +67,23 @@ class MjcsSession:
                 "inquirySearch" not in text)
 
     def request(self, *args, i=1, **kwargs):
-        if i > 2:
+        if i > 5:
             raise Exception("Too many recursed requests")
         self.requests += 1
         kwargs.setdefault("timeout", config.QUERY_TIMEOUT)
         response = self.session.request(*args, **kwargs)
 
         if self._needs_disclaimer(response):
-            logger.debug("Renewing session (disclaimer detected)...")
-            self.renew()
+            logger.debug(f"Renewing session (disclaimer detected, attempt {i})...")
+            if i >= 3:
+                # Hard reset: build a brand new HTTP session and re-accept disclaimer
+                wait = 30 * (i - 2)  # Back-off: 30s, 60s, 90s
+                logger.info(f"Hard resetting session after repeated disclaimers (waiting {wait}s)...")
+                time.sleep(wait)
+                self.new_session()
+            else:
+                time.sleep(5)
+                self.renew()
             return self.request(*args, i=i + 1, **kwargs)
         return response
 
