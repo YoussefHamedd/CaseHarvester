@@ -206,6 +206,11 @@ class Scraper:
                         detail_loc = body.get('detail_loc')
                         try:
                             self.scrape_case(case_number, detail_loc)
+                        except Forbidden:
+                            # IP is blocked — stop immediately to avoid making it worse
+                            logger.error(f"HTTP 403 Forbidden scraping {case_number} — IP blocked. Stopping scraper.")
+                            item.delete()
+                            raise
                         except FailedScrape:
                             pass
                         except Exception as e:
