@@ -96,7 +96,15 @@ class MjcsSession:
         soup = BeautifulSoup(response.text, "html.parser")
         disclaimer_input = soup.find("input", {"name": "disclaimer"})
         if not disclaimer_input:
-            logger.warning("No disclaimer token found - may already be authenticated")
+            # No disclaimer form found — verify we can actually reach the search page
+            test_resp = self.session.get(
+                f"{config.MJCS_BASE_URL}/inquirySearch.jis",
+                timeout=config.QUERY_TIMEOUT
+            )
+            if self._needs_disclaimer(test_resp):
+                # Still blocked — raise so the caller can hard-reset
+                raise Exception("Disclaimer not found but session is still blocked")
+            logger.info("Disclaimer accepted successfully")
             return response
 
         disclaimer_token = disclaimer_input.get("value")
