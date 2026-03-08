@@ -204,18 +204,18 @@ class Scraper:
                         body = json.loads(item.body)
                         case_number = body['case_number']
                         detail_loc = body.get('detail_loc')
-                        # Use a fresh session per case to avoid per-session rate limits
-                        self.fresh_session()
                         try:
                             self.scrape_case(case_number, detail_loc)
                         except FailedScrape:
                             pass
                         except Exception as e:
                             # Session-level errors (e.g. repeated disclaimers) - reset and continue
-                            logger.warning(f"Session error scraping {case_number}: {e}. Waiting before retry...")
-                            time.sleep(60)  # Longer cooldown after a session failure
+                            logger.warning(f"Session error scraping {case_number}: {e}. Resetting session...")
+                            if hasattr(self, '_session'):
+                                del self._session  # Force new session on next access
+                            time.sleep(30)  # Cooldown before next case
                         item.delete()
-                        time.sleep(15)  # Rate-limit protection (15s between cases)
+                        time.sleep(6)  # Rate-limit protection
                 else:
                     logger.info('No items in scraper queue.')
                     break
