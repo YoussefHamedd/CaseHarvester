@@ -28,11 +28,21 @@ class Forbidden(Exception):
 
 
 def _build_session():
+    import requests as std_requests
+    import urllib3
     proxy = os.getenv("SCRAPER_PROXY")
     scraperapi_key = os.getenv("SCRAPERAPI_KEY")
+
     if scraperapi_key:
-        proxy = f"http://scraperapi:{scraperapi_key}@proxy-server.scraperapi.com:8001"
-        logger.info("Using ScraperAPI for DataDome bypass")
+        # ScraperAPI handles TLS fingerprinting and IP rotation on their end.
+        # Use standard requests (not curl_cffi) to avoid proxy SSL cert issues.
+        proxy_url = f"http://scraperapi:{scraperapi_key}@proxy-server.scraperapi.com:8001"
+        logger.info("Using ScraperAPI proxy for IP ban bypass")
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        session = std_requests.Session()
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        session.verify = False  # ScraperAPI intercepts SSL with its own cert
+        return session
 
     session = cffi_requests.Session(impersonate="chrome110")
     if proxy:
