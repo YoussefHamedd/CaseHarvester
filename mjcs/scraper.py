@@ -9,6 +9,7 @@ import boto3
 import re
 import json
 import time
+import random
 import requests
 from datetime import datetime, timedelta
 from sqlalchemy import and_, or_, text, select, func
@@ -220,7 +221,7 @@ class Scraper:
                                 del self._session  # Force new session on next access
                             time.sleep(30)  # Cooldown before next case
                         item.delete()
-                        time.sleep(6)  # Rate-limit protection
+                        time.sleep(random.uniform(12, 20))  # Rate-limit protection (randomized)
                 else:
                     logger.info('No items in scraper queue.')
                     break

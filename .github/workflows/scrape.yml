@@ -1,0 +1,94 @@
+name: Scrape MJCS Cases
+
+on:
+  workflow_dispatch:  # Manual trigger from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hour max
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set up SSH tunnel to server DB/MinIO/Redis
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 109.205.177.80 >> ~/.ssh/known_hosts
+          # Tunnel: PostgreSQL (5432), MinIO (9000), Redis (6379)
+          ssh -N -f \
+            -L 5432:localhost:5432 \
+            -L 9000:localhost:9000 \
+            -L 6379:localhost:6379 \
+            -i ~/.ssh/id_ed25519 \
+            root@109.205.177.80
+          echo "SSH tunnel established"
+          sleep 3
+
+      - name: Create environment file
+        run: |
+          mkdir -p env
+          cat > env/production.env << 'EOF'
+          MJCS_DATABASE_URL=postgresql://mjcs_user:mjcs_password@localhost:5432/mjcs
+          CASE_DETAILS_BUCKET=mjcs-case-details
+          SPIDER_QUEUE_NAME=spider-queue
+          SCRAPER_QUEUE_NAME=scraper-queue
+          PARSER_QUEUE_NAME=parser-queue
+          PARSER_FAILED_QUEUE_NAME=parser-failed-queue
+          REDIS_URL=redis://localhost:6379/0
+          MINIO_ENDPOINT=http://localhost:9000
+          MINIO_ACCESS_KEY=minioadmin
+          MINIO_SECRET_KEY=minioadmin123
+          CASE_BATCH_SIZE=1000
+          QUERY_TIMEOUT=135
+          QUEUE_WAIT=5
+          SCRAPE_QUEUE_THRESHOLD=5000000
+          EOF
+
+      - name: Queue all unscraped cases
+        run: |
+          python3 harvester.py --environment production scraper --stale --include-unscraped
+
+      - name: Show queue size
+        run: |
+          python3 -c "
+          from dotenv import load_dotenv; import os; load_dotenv('env/production.env')
+          from sqlalchemy import create_engine, text
+          engine = create_engine(os.environ['MJCS_DATABASE_URL'])
+          with engine.connect() as conn:
+              remaining = conn.execute(text('SELECT COUNT(*) FROM cases WHERE last_scrape IS NULL AND scrape_exempt = false')).scalar()
+              scraped = conn.execute(text('SELECT COUNT(*) FROM cases WHERE last_scrape IS NOT NULL')).scalar()
+              print(f'Already scraped: {scraped} | To scrape: {remaining}')
+          "
+
+      - name: Run scraper
+        run: |
+          python3 harvester.py --environment production scraper --from-queue
+
+      - name: Final progress report
+        if: always()
+        run: |
+          python3 -c "
+          from dotenv import load_dotenv; import os; load_dotenv('env/production.env')
+          from sqlalchemy import create_engine, text
+          engine = create_engine(os.environ['MJCS_DATABASE_URL'])
+          with engine.connect() as conn:
+              total = conn.execute(text('SELECT COUNT(*) FROM cases')).scalar()
+              scraped = conn.execute(text('SELECT COUNT(*) FROM cases WHERE last_scrape IS NOT NULL')).scalar()
+              parsed = conn.execute(text('SELECT COUNT(*) FROM cases WHERE last_parse IS NOT NULL')).scalar()
+              remaining = conn.execute(text('SELECT COUNT(*) FROM cases WHERE last_scrape IS NULL AND scrape_exempt = false')).scalar()
+              print(f'Total: {total} | Scraped: {scraped} | Parsed: {parsed} | Remaining: {remaining}')
+          "
