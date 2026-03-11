@@ -39,9 +39,11 @@ jobs:
           sleep 3
 
       - name: Create environment file
+        env:
+          ZENROWS_KEY: ${{ secrets.ZENROWS_KEY }}
         run: |
           mkdir -p env
-          cat > env/production.env << 'EOF'
+          cat > env/production.env << EOF
           MJCS_DATABASE_URL=postgresql://mjcs_user:mjcs_password@localhost:5432/mjcs
           CASE_DETAILS_BUCKET=mjcs-case-details
           SPIDER_QUEUE_NAME=spider-queue
@@ -53,9 +55,10 @@ jobs:
           MINIO_ACCESS_KEY=minioadmin
           MINIO_SECRET_KEY=minioadmin123
           CASE_BATCH_SIZE=1000
-          QUERY_TIMEOUT=135
+          QUERY_TIMEOUT=60
           QUEUE_WAIT=5
           SCRAPE_QUEUE_THRESHOLD=5000000
+          ZENROWS_KEY=${ZENROWS_KEY}
           EOF
 
       - name: Queue all unscraped cases
