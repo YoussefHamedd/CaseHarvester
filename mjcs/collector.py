@@ -105,9 +105,12 @@ class Collector:
         elif self.text_is_case_type(item) and self.current_case:
             self.current_case.case_type = item.text
         elif self.text_is_filing_date(item) and self.current_case:
-            self.current_case.filing_date = datetime.strptime(item.text, self.date_format)
-            self.cases[self.current_case.case_number] = self.current_case
-            self.current_case = None
+            try:
+                self.current_case.filing_date = datetime.strptime(item.text, self.date_format)
+                self.cases[self.current_case.case_number] = self.current_case
+                self.current_case = None
+            except ValueError:
+                pass  # Skip non-date text (e.g. column headers) in the date column
 
     def text_is_court(self, item):
         return self.text_is_court_row(item) and self.text_is_case_number_column(item) and self.text_is_not_invalid(item, invalid_court_patterns)
