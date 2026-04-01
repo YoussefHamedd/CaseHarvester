@@ -3,7 +3,7 @@ from mjcs import models
 from mjcs.config import config
 from mjcs.models.common import TableBase
 from mjcs.spider import generate_spider_slices, Spider
-from mjcs.scraper import Scraper, RequestTimeout, Forbidden
+from mjcs.scraper import Scraper, Forbidden
 from mjcs.parser import Parser
 from mjcs.util import db_session, get_case_model_list
 from mjcs.collector import MDECCollector, BaltCityCollector
@@ -148,31 +148,21 @@ def valid_date(s):
 def run_spider(args):
     if args.from_queue:
         logger.info(f'{socket.gethostname()} spidering from queue')
-        spider = Spider()
+        spider = Spider(args.concurrency)
         try:
-            spider.spider_from_queue(record_metrics=args.record_metrics)
-        except (RequestTimeout, Forbidden) as e:
+            spider.spider_from_queue(forever=args.forever)
+        except Forbidden as e:
             logger.warning(f'Caught {type(e).__name__} error: {e}')
-        finally:
-            if args.shutdown:
-                logger.info('Shutting down the system.')
-                if hasattr(args, 'log') and args.log:
-                    os.remove(args.log)
-                subprocess.run(["shutdown", "now"])
-    elif args.start_date:    
+    elif args.start_date:
         generate_spider_slices(args.start_date, args.end_date or datetime.now(), args.court, args.site)
     else:
-        raise Exception("Must specify search criteria, --launch-instances, --terminate-instances, or --from-queue")
+        raise Exception("Must specify search criteria or --from-queue")
 
 def run_collector(args):
-    if args.list == 'MDEC':
-        collector = MDECCollector()
-    elif args.list == 'BaltimoreCity':
-        collector = BaltCityCollector()
-    collector.collect_case_numbers(args.date)
+    MDECCollector().collect_case_numbers(args.date)
 
 def run_scraper(args):
-    scraper = Scraper()
+    scraper = Scraper(args.concurrency)
     if args.case:
         scraper.scrape_case(args.case)
     elif args.stale:
@@ -183,15 +173,9 @@ def run_scraper(args):
     elif args.from_queue:
         logger.info(f'{socket.gethostname()} scraping from queue')
         try:
-            scraper.scrape_from_queue(record_metrics=args.record_metrics)
-        except (RequestTimeout, Forbidden) as e:
+            scraper.scrape_from_queue(forever=args.forever)
+        except Forbidden as e:
             logger.warning(f'Caught {type(e).__name__} error: {e}')
-        finally:
-            if args.shutdown:
-                logger.info('Shutting down the system.')
-                if hasattr(args, 'log') and args.log:
-                    os.remove(args.log)
-                subprocess.run(["shutdown", "now"])
     else:
         raise Exception("Must specify --case, --from-queue, --stale, or --stale-count.")
 
@@ -278,12 +262,12 @@ if __name__ == '__main__':
         help="What venues to search, criminal/civil/traffic/civil citation")
     parser_spider.add_argument('--verbose', '-v', action='store_true',
         help="Print debug information")
+    parser_spider.add_argument('--concurrency', type=int, default=1,
+        help="Number of concurrent MJCS sessions (default: 1)")
     parser_spider.add_argument('--from-queue', action='store_true',
         help="Spider MJCS with queries from the spider queue")
-    parser_spider.add_argument('--shutdown', action='store_true',
-        help="Shutdown machine after rate limit (must be run as root)")
-    parser_spider.add_argument('--record-metrics', action='store_true',
-        help="Send metrics to Cloudwatch every minute")
+    parser_spider.add_argument('--forever', action='store_true',
+        help="Don't exit when queue is empty, keep checking")
     parser_spider.set_defaults(func=run_spider)
 
     parser_collector = subparsers.add_parser('collector',
@@ -311,12 +295,12 @@ if __name__ == '__main__':
         help="Include unscraped case numbers when rescraping")
     parser_scraper.add_argument('--include-inactive', action='store_true',
         help="Include inactive cases when rescraping")
+    parser_scraper.add_argument('--concurrency', type=int, default=1,
+        help="Number of concurrent MJCS sessions (default: 1)")
     parser_scraper.add_argument('--from-queue', action='store_true',
         help="Scrape cases from the scraper queue")
-    parser_scraper.add_argument('--shutdown', action='store_true',
-        help="Shutdown machine after rate limit (must be run as root)")
-    parser_scraper.add_argument('--record-metrics', action='store_true',
-        help="Send metrics to Cloudwatch every minute")
+    parser_scraper.add_argument('--forever', action='store_true',
+        help="Don't exit when queue is empty, keep checking")
     parser_scraper.set_defaults(func=run_scraper)
 
     parser_parser = subparsers.add_parser('parser',

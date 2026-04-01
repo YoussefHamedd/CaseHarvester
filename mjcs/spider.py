@@ -1,407 +1,360 @@
-from .config import config
-from .util import send_to_queue, db_session, split_date_range, RepeatedTimer
-from .models import Case
-from .session import MjcsSession, RequestTimeout, Forbidden
-from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
-from sqlalchemy import select
-import xml.etree.ElementTree as ElementTree
+"""
+Spider rewritten for new React SPA API (Case Portal 1.0).
+Uses curl_cffi firefox135 to bypass DataDome.
+POST /api-caselist/v1/cases  →  JSON array of up to 600 cases.
+Includes delays between requests to avoid rate-limiting.
+"""
 import json
+import os
 import logging
+import random
 import string
 import time
-import requests
-import re
-import boto3
+from datetime import datetime, timedelta
+
+import trio
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
+
+from .config import config
+from .models import Case
+from .util import db_session, send_to_queue, split_date_range
+
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    cffi_requests = None
 
 logger = logging.getLogger('mjcs')
 
-# searching for underscore character leads to timeout for some reason
-# % is a wildcard character
-search_chars = string.ascii_uppercase \
-    + string.digits \
-    + string.punctuation.replace('_','').replace('%','') \
-    + ' '
+BASE_URL = 'https://casesearch.courts.state.md.us'
+SEARCH_URL = f'{BASE_URL}/api-caselist/v1/cases'
+MAX_RESULTS = 600  # API hard cap
 
-def delta_seconds(timestamp):
-        return (datetime.now() - timestamp).total_seconds()
+SEARCH_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Content-Type': 'application/json',
+    'Origin': BASE_URL,
+    'Referer': f'{BASE_URL}/casesearch/inquiry-search',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+}
+
+# Characters for 2-char prefix generation
+FIRST_CHARS = string.ascii_uppercase + string.digits
+SECOND_CHARS = string.ascii_uppercase + string.digits + ' '
 
 class FailedSearch(Exception):
-    pass
-
-class FailedSearchTimeout(FailedSearch):
-    pass
-
-class FailedSearch500Error(FailedSearch):
-    pass
-
-class FailedSearchUnknownError(FailedSearch):
-    pass
-
-class FailedSearchUnavailable(FailedSearch):
     pass
 
 class CompletedSearchNoResults(Exception):
     pass
 
 
-class Spider:
-    def __init__(self):
-        self.requests = 0
-        self.queries = 0
-        self.new_cases = 0
-        self.last_request_count = 0
-        self.last_query_count = 0
-        self.last_new_case_count = 0
-        self.metrics = []
-    
-    @property
-    def instance_id(self):
-        if not hasattr(self, '_instance_id'):
-            from ec2_metadata import ec2_metadata
-            self._instance_id = ec2_metadata.instance_id
-        return self._instance_id
+def generate_spider_slices(range_start_date, range_end_date=None, court=None, site=None):
+    """
+    Generate 2-char last name prefix × date range slices and push to queue.
+    With 16 days/query and ~23 date ranges per year, and ~1332 prefixes,
+    this yields ~30k initial slices.
+    """
+    if range_end_date is None:
+        range_end_date = datetime.now()
 
-    @property
-    def session(self):
-        if not hasattr(self, '_session'):
-            self._session = MjcsSession()
-        return self._session
+    days = config.SPIDER_DAYS_PER_QUERY  # default 16
 
-    def record_metrics(self):
-        now = datetime.now()
-        new_request_count = self.session.requests
-        delta_requests = new_request_count - self.last_request_count
-        self.last_request_count = new_request_count
-        
-        new_query_count = self.queries
-        delta_queries = new_query_count - self.last_query_count
-        self.last_query_count = new_query_count
-        
-        new_new_case_count = self.new_cases
-        delta_new_cases = new_new_case_count - self.last_new_case_count
-        self.last_new_case_count = new_new_case_count
-
-        dimensions = [
-            {
-                'Name': 'InstanceId',
-                'Value': self.instance_id
-            },
-            {
-                'Name': 'Environment',
-                'Value': config.environment
-            }
-        ]
-        self.metrics += [
-            {
-                'MetricName': 'SpiderRequests',
-                'Dimensions': dimensions,
-                'Timestamp': now,
-                'Value': delta_requests
-            },
-            {
-                'MetricName': 'SpiderQueries',
-                'Dimensions': dimensions,
-                'Timestamp': now,
-                'Value': delta_queries
-            },
-            {
-                'MetricName': 'SpiderNewCases',
-                'Dimensions': dimensions,
-                'Timestamp': now,
-                'Value': delta_new_cases
-            }
-        ]
-    
-    def report(self):
-        config.boto3_session.client('cloudwatch').put_metric_data(
-            Namespace='CaseHarvester',
-            MetricData=self.metrics
-        )
-
-    def spider_from_queue(self, record_metrics=False, skip_search_errors=True):
-        if record_metrics:
-            timer = RepeatedTimer(60, self.record_metrics)
-            timer.start()
-        try:
-            while True:
-                queue_items = config.spider_queue.receive_messages(
-                    WaitTimeSeconds = config.QUEUE_WAIT,
-                    MaxNumberOfMessages = 10
-                )
-                if queue_items:
-                    for item in queue_items:
-                        body = json.loads(item.body)
-                        range_start_date = datetime.fromisoformat(body['range_start_date'])
-                        range_end_date = datetime.fromisoformat(body['range_end_date'])
-                        search_string = body['search_string']
-                        court = body.get('court')
-                        site = body.get('site')
-                        node = SearchNode(range_start_date, range_end_date, search_string, court, site)
-                        try:
-                            new_cases = node.search(self.session)
-                            self.new_cases += new_cases
-                        except FailedSearch:
-                            if not skip_search_errors:
-                                raise
-                        item.delete()
-                        self.queries += 1
-                else:
-                    logger.info('No items in spider queue.')
-                    break
-        finally:
-            if record_metrics:
-                timer.stop()
-                self.record_metrics()
-                self.report()
-            logger.info(f'Number of queries: {self.queries}')
-            logger.info(f'Number of new case numbers: {self.new_cases}')
-
-
-def generate_spider_slices(range_start_date, range_end_date=datetime.now(), court=None, site=None):
-    def gen_timeranges(start_date, end_date):
-        for n in range(0,int((end_date - start_date).days),config.SPIDER_DAYS_PER_QUERY):
-            start = start_date + timedelta(n)
-            end = start_date + timedelta(n) + timedelta(config.SPIDER_DAYS_PER_QUERY - 1)
-            if end > end_date:
-                end = end_date
-            if start == end:
-                end = start
-            yield (start,end)
-    
     slices = []
-    for (start,end) in gen_timeranges(range_start_date, range_end_date):
-        for char1 in search_chars.replace(' ',''): # don't start queries with a space
-            for char2 in search_chars: # don't start queries with a space
-                slices.append(
-                    json.dumps({
-                        'range_start_date': start.isoformat(),
-                        'range_end_date': end.isoformat(),
-                        'court': court,
-                        'site': site,
-                        'search_string': f'{char1}{char2}',
-                    })
-                )
-    
+    current = range_start_date
+    while current <= range_end_date:
+        end = min(current + timedelta(days - 1), range_end_date)
+        for c1 in FIRST_CHARS:
+            for c2 in SECOND_CHARS:
+                slices.append(json.dumps({
+                    'range_start_date': current.isoformat(),
+                    'range_end_date': end.isoformat(),
+                    'search_string': c1 + c2,
+                    'court': court,
+                }))
+        current = end + timedelta(1)
+
     logger.info(f'Submitting {len(slices)} slices for spidering')
     send_to_queue(config.spider_queue, slices)
 
 
-class SearchNode:    
-    def __init__(self, range_start_date, range_end_date, search_string, court=None, site=None):
+_PROFILES = ['firefox133', 'firefox135', 'firefox144']
+_REFRESH_AFTER = 25  # replace session with a fresh one every N uses
+
+class CurlSession:
+    """Pool of curl_cffi sessions with auto-refresh to avoid DataDome rate limits."""
+
+    def __init__(self, size):
+        self._size = size
+        self._send_chan = None
+        self._recv_chan = None
+        self._use_counts = {}
+        self._profile_idx = 0
+        _puser = os.getenv('PROXY_USERNAME', '')
+        _ppass = os.getenv('PROXY_PASSWORD', '')
+        _phost = os.getenv('PROXY_HOST', '')
+        _pport = os.getenv('PROXY_PORT', '80')
+        self._proxies = {'https': f'http://{_puser}:{_ppass}@{_phost}:{_pport}'} if _phost else {}
+
+    def _new_session(self):
+        profile = _PROFILES[self._profile_idx % len(_PROFILES)]
+        self._profile_idx += 1
+        s = cffi_requests.Session(impersonate=profile, proxies=self._proxies)
+        self._use_counts[id(s)] = 0
+        return s
+
+    async def start_all(self):
+        self._send_chan, self._recv_chan = trio.open_memory_channel(self._size)
+        for _ in range(self._size):
+            await self._send_chan.send(self._new_session())
+
+    async def get(self):
+        return await self._recv_chan.receive()
+
+    def put_nowait(self, session):
+        self._use_counts[id(session)] = self._use_counts.get(id(session), 0) + 1
+        if self._use_counts[id(session)] >= _REFRESH_AFTER:
+            session = self._new_session()
+        try:
+            self._send_chan.send_nowait(session)
+        except trio.WouldBlock:
+            pass
+
+    async def close_all(self):
+        pass  # curl_cffi sessions close automatically
+
+
+class Spider:
+    def __init__(self, concurrency=3):
+        self.concurrency = concurrency
+        self.session_pool = CurlSession(concurrency)
+
+    def spider_from_queue(self, forever=False):
+        trio.run(self.__start_service, forever)
+
+    async def __start_service(self, forever):
+        logger.info('Initiating spider service.')
+        await self.session_pool.start_all()
+        logger.info(f'Started {self.concurrency} curl_cffi sessions.')
+        try:
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(self.__queue_manager, nursery, forever)
+        except KeyboardInterrupt:
+            print('Caught KeyboardInterrupt: stopping service.')
+        await self.session_pool.close_all()
+        logger.info('Spider service stopped.')
+
+    async def __queue_manager(self, nursery, forever):
+        while True:
+            if len(nursery.child_tasks) < 100:
+                queue_items = config.spider_queue.receive_messages(
+                    WaitTimeSeconds=config.QUEUE_WAIT,
+                    MaxNumberOfMessages=10,
+                )
+                if queue_items:
+                    for item in queue_items:
+                        body = json.loads(item.body)
+                        node = SearchNode(
+                            self.session_pool,
+                            datetime.fromisoformat(body['range_start_date']),
+                            datetime.fromisoformat(body['range_end_date']),
+                            body['search_string'],
+                            body.get('court'),
+                        )
+                        nursery.start_soon(node.search)
+                        item.delete()
+                else:
+                    logger.info('No items in spider queue.')
+                    if not forever:
+                        break
+                    await trio.sleep(5 * 60)
+            else:
+                await trio.sleep(5)
+
+
+class SearchNode:
+    def __init__(self, session_pool, range_start_date, range_end_date, search_string, court=None):
+        self.session_pool = session_pool
         self.range_start_date = range_start_date
         self.range_end_date = range_end_date
-        self.court = court
-        self.site = site
         self.search_string = search_string
+        self.court = court
 
     @property
     def id(self):
-        id = f'{self.range_start_date.strftime("%Y-%m-%d")}/{self.range_end_date.strftime("%Y-%m-%d")}'
-        if self.court:
-            id += '/' + self.court
-        if self.site:
-            id += '/' + self.site
-        id = f'{id}/{self.search_string}'
-        return id
+        d = f'{self.range_start_date:%Y-%m-%d}/{self.range_end_date:%Y-%m-%d}'
+        return f'{d}/{self.search_string}'
 
-    def search(self, session):
+    async def search(self):
+        session = await self.session_pool.get()
         try:
-            response = self.__get_results(session)
-        except FailedSearchTimeout:
-            if self.range_start_date == self.range_end_date:
-                self.__spawn_children()
-            else:
-                self.__split()
-            return 0
-        except CompletedSearchNoResults:
-            return 0
-        
-        # Parse XML (escape bare & chars in firm names before parsing)
-        xml_text = re.sub(r'&(?!amp;|lt;|gt;|apos;|quot;|#)', '&amp;', response.text)
-        try:
-            root = ElementTree.fromstring(xml_text)
-        except ElementTree.ParseError as e:
-            err_line, err_col = e.position
-            xml_lines = xml_text.split('\n')
-            problem = xml_lines[err_line-1] if err_line <= len(xml_lines) else '?'
-            logger.warning(f'Failed to parse XML: {e} | line content: {repr(problem[:120])}')
-            return 0
-
-        rows = [[element.text for element in row] for row in root]
-
-        # Process results
-        processed_cases = {}
-        for row in rows:
-            case_number = row[0]
-            if not processed_cases.get(case_number): # case numbers can appear multiple times in results
-                if row[7]:
-                    try:
-                        filing_date = datetime.strptime(row[7],"%m/%d/%Y")
-                    except:
-                        filing_date = None
-                else:
-                    filing_date = None
-                case = Case(
-                    case_number = row[0],
-                    court = row[4],
-                    case_type = row[5],
-                    status = row[6],
-                    filing_date = filing_date,
-                    filing_date_original = row[7],
-                    caption = row[8],
-                    query_court = self.court,
-                    detail_loc = 'Unknown'
-                )
-                processed_cases[case_number] = case
-        logger.debug(f"Search string {self.search_string} returned {len(rows)} items ({len(processed_cases)} unique)")
-
-        new_cases = []
-        with db_session() as db:
-            # See which cases need to be added to DB
-            existing_cases = db.scalars(
-                select(Case.case_number)
-                .where(Case.case_number.in_(processed_cases.keys()))
-            ).all()
-            new_case_numbers = set(processed_cases.keys()) - set(existing_cases)
-            new_cases = [processed_cases[x] for x in new_case_numbers]
-
-            # Save new cases to database
-            db.add_all(new_cases)
-
-            # Then send them to the scraper queue
-            messages = [
-                json.dumps({
-                    'case_number': case.case_number,
-                    'detail_loc': case.detail_loc,
-                    'loc': case.loc
-                }) for case in new_cases
-            ]
-            send_to_queue(config.scraper_queue, messages)
-            
-        if len(new_cases) > 0:
-            logger.info(f"{self.id} added {len(new_cases)} new cases")
-        
-        if len(rows) == 500:
-            # Procreate!
-            self.__spawn_children()
-        
-        return len(new_cases)
-
-    def __get_results(self, session):
-        try:
-            response = session.request(
-                method='GET',
-                url = f'{config.MJCS_BASE_URL}/inquirySearch.jis'
+            # Run blocking HTTP call in a thread
+            results = await trio.to_thread.run_sync(
+                lambda: self._do_search(session)
             )
-        except requests.Timeout:
-            raise RequestTimeout
+        finally:
+            self.session_pool.put_nowait(session)
 
-        if response.status_code == 403:
-            raise Forbidden
-        elif response.status_code != 200:
-            logger.warning("Failed to retrieve search page")
-            raise FailedSearchUnknownError(response.text)
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        try:
-            search_type = soup.find('input',{'name':'searchtype'}).get('value')
-        except AttributeError:
-            logger.warning("Failed to find searchtype input in search page")
-            raise FailedSearchUnknownError
-
-        query_params = {
-            'lastName':self.search_string + '%',
-            # 'firstName': '%',
-            'countyName':self.court,
-            'site':self.site,
-            'company':'N',
-            'filingStart':self.range_start_date.strftime("%-m/%-d/%Y"),
-            'filingEnd':self.range_end_date.strftime("%-m/%-d/%Y"),
-            'd-16544-e': 3,  # XML
-            'searchtype': search_type
-        }
-        
-        logger.debug(f'Searching for {self.id}')
-        try:
-            response = session.request(
-                method='POST',
-                url=f'{config.MJCS_BASE_URL}/inquirySearch.jis',
-                data={k: v for k, v in query_params.items() if v is not None}
-            )
-        except requests.Timeout:
-            raise RequestTimeout
-
-        if response.status_code == 403:
-            raise Forbidden
-        elif response.status_code == 500:
-            logger.warning(f"Received 500 error: {self.id}")
-            raise FailedSearch500Error(response.text)
-        elif response.status_code != 200:
-            logger.warning(f"Unknown error. response code: {response.status_code}, response body: {response.text}")
-            raise FailedSearchUnknownError(f'Response status code {response.status_code}, body {response.text}')
-        elif ('text/html' in response.headers['Content-Type'] and
-                re.search(r'<span class="error">\s*<br>CaseSearch will only display results',response.text)):
-            # logger.debug("No cases for search string %s starting on %s" % (self.search_string,self.range_start_date.strftime("%-m/%-d/%Y")))
-            raise CompletedSearchNoResults
-        elif ('text/html' in response.headers['Content-Type'] and
-                re.search(r'<span class="error">\s*<br>Sorry, but your query has timed out after 2 minute',response.text)):
-            logger.warning(f"MJCS Query Timeout: {self.id}")
-            raise FailedSearchTimeout
-        elif 'text/html' in response.headers['Content-Type'] and 'Case Search is temporarily unavailable' in response.text:
-            logger.warning(f"MJCS Unavailable error: {self.id}")
-            raise FailedSearchUnavailable
-        elif ('text/html' in response.headers['Content-Type'] and
-                re.search(r'<span class="error">\s*<br>Invalid Search Criteria!',response.text)):
-            raise CompletedSearchNoResults
-
-        time.sleep(2)  # Rate-limit protection: 2s between queries
-        return response
-
-    def __spawn_children(self):
-        slices = []
-        for char in search_chars.replace(' ',''): # don't start queries with a space
-            slices.append(
-                json.dumps({
-                    'range_start_date': self.range_start_date.isoformat(),
-                    'range_end_date': self.range_end_date.isoformat(),
-                    'court': self.court,
-                    'site': self.site,
-                    'search_string': self.search_string + char,
-                })
-            )
-            slices.append(
-                json.dumps({
-                    'range_start_date': self.range_start_date.isoformat(),
-                    'range_end_date': self.range_end_date.isoformat(),
-                    'court': self.court,
-                    'site': self.site,
-                    'search_string': self.search_string + ' ' + char,
-                })
-            )
-
-        send_to_queue(config.spider_queue, slices)
-        logger.info(f'Submitted {len(slices)} slices for spidering')
-
-    def __split(self):
-        if self.range_start_date == self.range_end_date:
+        if results is None:
             return
-        logger.debug(f'Splitting date range {self.id}')
-        range1, range2 = split_date_range(self.range_start_date, self.range_end_date)
+
+        if len(results) >= MAX_RESULTS:
+            if len(self.search_string) <= 15:
+                self._spawn_children()
+            elif self.range_start_date != self.range_end_date:
+                self._split()
+
+    def _do_search(self, session):
+        """Synchronous search — runs in a thread."""
+        body = {
+            'searchPartyType': 'Person',
+            'lastName': self.search_string,
+            'firstName': '',
+            'middleName': '',
+            'businessName': '',
+            'startDate': self.range_start_date.strftime('%-m/%-d/%Y'),
+            'endDate': self.range_end_date.strftime('%-m/%-d/%Y'),
+        }
+        if self.court:
+            body['county'] = self.court
+
+        # Polite delay: 2–5 s jitter between requests
+        time.sleep(random.uniform(2.0, 5.0))
+
+        try:
+            r = session.post(
+                SEARCH_URL,
+                headers=SEARCH_HEADERS,
+                data=json.dumps(body),
+                timeout=90,
+            )
+        except Exception as e:
+            logger.warning(f'Request error for {self.id}: {e}')
+            # Re-queue for later retry
+            send_to_queue(config.spider_queue, [json.dumps({
+                'range_start_date': self.range_start_date.isoformat(),
+                'range_end_date': self.range_end_date.isoformat(),
+                'search_string': self.search_string,
+                'court': self.court,
+            })])
+            return None
+
+        if r.status_code == 403:
+            # Drop old-format slices with punctuation — they will never succeed
+            # Only alphanumeric + space are valid search prefixes for the new API
+            valid_chars = set('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ')
+            if not all(c in valid_chars for c in self.search_string.upper()):
+                logger.debug(f'Dropping invalid search string {self.search_string!r}')
+                return []
+            if 'captcha-delivery' in r.text:
+                logger.warning(f'DataDome blocked {self.id} — re-queuing')
+            else:
+                logger.warning(f'403 for {self.id}: {r.text[:200]}')
+            send_to_queue(config.spider_queue, [json.dumps({
+                'range_start_date': self.range_start_date.isoformat(),
+                'range_end_date': self.range_end_date.isoformat(),
+                'search_string': self.search_string,
+                'court': self.court,
+            })])
+            return None
+
+        if r.status_code == 400:
+            # "CaseSearch will only display results..." — empty result set
+            return []
+
+        if r.status_code != 200:
+            logger.warning(f'{r.status_code} for {self.id}: {r.text[:200]}')
+            return None
+
+        try:
+            data = json.loads(r.text)
+        except Exception:
+            logger.warning(f'JSON parse error for {self.id}: {r.text[:200]}')
+            return None
+
+        if not isinstance(data, list):
+            logger.warning(f'Unexpected response for {self.id}: {type(data)} {str(data)[:200]}')
+            return None
+
+        # Deduplicate and build case records
+        seen = {}
+        for row in data:
+            cid = row.get('caseNumber', '').strip()
+            if not cid or cid in seen:
+                continue
+            fd_str = row.get('filingDate', '') or ''
+            filing_date = None
+            if fd_str:
+                try:
+                    filing_date = datetime.strptime(fd_str, '%m/%d/%Y').date()
+                except ValueError:
+                    pass
+            seen[cid] = {
+                'case_number': cid,
+                'court': row.get('locationName', ''),
+                'case_type': row.get('caseType', ''),
+                'status': row.get('caseStatus', ''),
+                'filing_date': filing_date,
+                'filing_date_original': fd_str,
+                'caption': row.get('title', ''),
+                'detail_loc': 'MJCS2',
+            }
+
+        if not seen:
+            logger.debug(f'{self.id}: 0 results')
+            return []
+
+        with db_session() as db:
+            existing = set(db.scalars(
+                select(Case.case_number)
+                .where(Case.case_number.in_(seen.keys()))
+            ).all())
+            new_cases = [v for k, v in seen.items() if k not in existing]
+
+            if new_cases:
+                db.execute(insert(Case).values(new_cases).on_conflict_do_nothing())
+                send_to_queue(config.scraper_queue, [
+                    json.dumps({'case_number': c['case_number'], 'detail_loc': c['detail_loc']})
+                    for c in new_cases
+                ])
+                logger.info(f'{self.id}: +{len(new_cases)} new / {len(data)} total')
+            else:
+                logger.debug(f'{self.id}: {len(data)} results, all known')
+
+        return data
+
+    def _spawn_children(self):
+        slices = [
+            json.dumps({
+                'range_start_date': self.range_start_date.isoformat(),
+                'range_end_date': self.range_end_date.isoformat(),
+                'search_string': self.search_string + c,
+                'court': self.court,
+            })
+            for c in (FIRST_CHARS + ' ')
+        ]
+        send_to_queue(config.spider_queue, slices)
+        logger.info(f'Spawned {len(slices)} children for {self.id}')
+
+    def _split(self):
+        r1, r2 = split_date_range(self.range_start_date, self.range_end_date)
         send_to_queue(config.spider_queue, [
             json.dumps({
-                'range_start_date': range1[0].isoformat(),
-                'range_end_date': range1[1].isoformat(),
-                'court': self.court,
-                'site': self.site,
+                'range_start_date': r1[0].isoformat(),
+                'range_end_date': r1[1].isoformat(),
                 'search_string': self.search_string,
+                'court': self.court,
             }),
             json.dumps({
-                'range_start_date': range2[0].isoformat(),
-                'range_end_date': range2[1].isoformat(),
-                'court': self.court,
-                'site': self.site,
+                'range_start_date': r2[0].isoformat(),
+                'range_end_date': r2[1].isoformat(),
                 'search_string': self.search_string,
-            })
+                'court': self.court,
+            }),
         ])
-        
+        logger.debug(f'Split date range for {self.id}')

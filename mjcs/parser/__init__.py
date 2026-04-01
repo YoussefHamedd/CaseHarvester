@@ -41,6 +41,7 @@ from .PGV import PGVParser
 from .MCCR import MCCRParser
 from .ODYCOSA import ODYCOSAParser
 from .ODYCOA import ODYCOAParser
+from .MJCS2 import MJCS2Parser
 
 # ordered by most common case type
 parsers = {
@@ -61,17 +62,35 @@ parsers = {
     'MCCR': MCCRParser,
     'K': KParser,
     'ODYCOSA': ODYCOSAParser,
-    'ODYCOA': ODYCOAParser
+    'ODYCOA': ODYCOAParser,
+    'MJCS2': MJCS2Parser
 }
 
 def parse_case(case_number, detail_loc=None, parse_as=None):
-    case_details = config.case_details_bucket.Object(case_number).get()
-    case_html = case_details['Body'].read().decode('utf-8')
+    from botocore.exceptions import ClientError
+    try:
+        case_details = config.case_details_bucket.Object(case_number).get()
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            logger.warning(f"Skipping {case_number}: not found in Minio (NoSuchKey)")
+            return
+        raise
+    raw_body = case_details['Body'].read()
+    case_html = raw_body.decode('utf-8')
+
     if not detail_loc:
         try:
             detail_loc = case_details['Metadata']['detail_loc']
         except KeyError:
             detail_loc = get_detail_loc(case_number)
+
+    # Detect JSON content (new React SPA API) — always use MJCS2Parser
+    stripped = case_html.strip()
+    if stripped.startswith('{') or detail_loc == 'MJCS2':
+        logger.debug(f'Parsing case {case_number} as MJCS2 (JSON)')
+        MJCS2Parser(case_number, case_html).parse()
+        logger.debug(f'Successfully parsed {case_number} as MJCS2')
+        return
 
     if parse_as:
         logger.debug(f'Parsing case {case_number} as {parse_as}')
@@ -95,7 +114,7 @@ def parse_case(case_number, detail_loc=None, parse_as=None):
             else:
                 logger.debug(f"Successfully parsed {case_number}")
                 return
-        
+
         # Try all parsers
         for category, parser in parsers.items():
             try:
@@ -142,7 +161,7 @@ class Parser:
                 or_(Case.detail_loc.in_(parsers.keys()), Case.detail_loc == 'Unknown'))
         with db_session() as db:
             self.load_into_queue(db.execute(select(Case.case_number, Case.detail_loc).distinct().where(filter)).all(), config.parser_queue)
-    
+
     def parse_stale(self, detail_loc=None):
         logger.info(f'Loading stale cases of type {detail_loc if detail_loc else "ANY"} into parser queue')
         if detail_loc:
@@ -170,7 +189,7 @@ class Parser:
             logger.info(f'Parsing cases from queue as {parse_as}')
         else:
             logger.info('Parsing cases from queue')
-        
+
         if self.parallel:
             from multiprocessing import Pool
             cpus = cpu_count()
@@ -235,7 +254,7 @@ class Parser:
                             raise
                     finally:
                         queue.delete_messages(Entries=[{'Id': 'unused', 'ReceiptHandle': receipt_handle}])
-    
+
     def load_into_queue(self, results, queue):
         messages = [
             json.dumps({
